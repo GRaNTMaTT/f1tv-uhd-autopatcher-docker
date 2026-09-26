@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
+"""Download F1TV Android TV APKM bundle from APKMirror using Playwright.
 
-"""
-Download the F1 TV Android TV APKM bundle from APKMirror using Playwright.
+APKMirror download flow (3 pages):
+  1. Release page   -> table of variants (APK, APK Bundle, etc.)
+  2. Variant page   -> "Download APK Bundle" button with ?key= param
+  3. Download page  -> countdown timer, then file download auto-starts
 
-APKMirror download flow:
-
-1. Release page
-   - Contains one or more APK/APKM variants.
-
-2. Variant page
-   - Contains the "Download APK Bundle" button.
-
-3. Download trigger page
-   - Contains the final #download-link URL.
-
-4. Browser download
-   - Captured directly with Playwright page.expect_download().
-
-Debug screenshots are saved at each major step.
+Screenshots are saved at each step for debugging CI failures.
 """
 
 import argparse
@@ -25,19 +14,13 @@ import sys
 import time
 from pathlib import Path
 
-from playwright.sync_api import (
-    sync_playwright,
-    TimeoutError as PwTimeout,
-)
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
 
 
 BASE = "https://www.apkmirror.com"
 
 
-# ---------------------------------------------------------------------------
-# Ad / tracking blocking
-# ---------------------------------------------------------------------------
-
+# Block ad/tracking domains at the network level.
 AD_DOMAIN_KEYWORDS = [
     "doubleclick.net",
     "googlesyndication.com",
@@ -75,12 +58,10 @@ AD_DOMAIN_KEYWORDS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# JavaScript used to remove overlays / ads / consent dialogs
-# ---------------------------------------------------------------------------
-
+# JS to nuke ad overlays, modals, and consent banners from the DOM.
 NUKE_ADS_JS = """
 () => {
+    // Remove elements by common ad selectors
     const selectors = [
         '[id*="google_ads"]',
         '[id*="aswift"]',
@@ -89,68 +70,47 @@ NUKE_ADS_JS = """
         '[class*="ad-wrapper"]',
         '[class*="interstitial"]',
         '[class*="modal-backdrop"]',
-
         'iframe[src*="doubleclick"]',
         'iframe[src*="googlesyndication"]',
         'iframe[id*="aswift"]',
         'iframe[id*="google_ads"]',
-
         '[id*="consent"]',
         '[class*="consent"]',
         '[class*="cookie-banner"]',
-
         '.fc-dialog-container',
         '.fc-consent-root',
-
         '#cmpbox',
         '#cmpbox2',
-
         '[id*="sp_message"]',
-        '[class*="sp_message"]'
+        '[class*="sp_message"]',
     ];
 
     let removed = 0;
 
-    for (const selector of selectors) {
-        for (const element of document.querySelectorAll(selector)) {
-            element.remove();
+    for (const sel of selectors) {
+        for (const el of document.querySelectorAll(sel)) {
+            el.remove();
             removed++;
         }
     }
 
-    /*
-     * Remove large fixed/sticky overlays that may intercept clicks.
-     */
-    for (const element of document.querySelectorAll(
-        'div, aside, section'
-    )) {
-        const style = window.getComputedStyle(element);
+    // Remove any fixed/sticky overlays covering the page
+    for (const el of document.querySelectorAll('div, aside, section')) {
+        const style = window.getComputedStyle(el);
 
-        const fixed =
-            style.position === 'fixed' ||
-            style.position === 'sticky';
-
-        const highZ =
-            parseFloat(style.zIndex || '0') > 999;
-
-        const large =
-            element.offsetWidth > window.innerWidth * 0.5 &&
-            element.offsetHeight > window.innerHeight * 0.3;
-
-        if (fixed && highZ && large) {
-            element.remove();
+        if (
+            (style.position === 'fixed' || style.position === 'sticky') &&
+            parseFloat(style.zIndex) > 999 &&
+            el.offsetWidth > window.innerWidth * 0.5 &&
+            el.offsetHeight > window.innerHeight * 0.3
+        ) {
+            el.remove();
             removed++;
         }
     }
 
-    /*
-     * Some dialogs disable page scrolling even after the dialog itself
-     * has been removed.
-     */
-    if (document.body) {
-        document.body.style.overflow = 'auto';
-    }
-
+    // Reset body overflow in case ads locked scrolling
+    document.body.style.overflow = 'auto';
     document.documentElement.style.overflow = 'auto';
 
     return removed;
@@ -158,171 +118,100 @@ NUKE_ADS_JS = """
 """
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-def log(message: str) -> None:
-    print(
-        f"[download] {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+def log(msg: str):
+    print(f"[download] {msg}", file=sys.stderr, flush=True)
 
 
-# ---------------------------------------------------------------------------
-# Screenshot helper
-# ---------------------------------------------------------------------------
-
-def screenshot(page, output_dir: Path, name: str) -> None:
+def screenshot(page, output_dir: Path, name: str):
     path = output_dir / f"debug_{name}.png"
 
-    try:
-        page.screenshot(
-            path=str(path),
-            full_page=True,
-        )
+    page.screenshot(
+        path=str(path),
+        full_page=True,
+    )
 
-        log(f"  screenshot: {path}")
-
-    except Exception as exc:
-        log(
-            f"  WARN: Could not save screenshot "
-            f"{path}: {exc}"
-        )
+    log(f"  screenshot: {path}")
 
 
-# ---------------------------------------------------------------------------
-# Remove advertisements and overlays
-# ---------------------------------------------------------------------------
+def nuke_ads(page):
+    """Remove ad overlays and modals from the DOM."""
 
-def nuke_ads(page) -> None:
     try:
         removed = page.evaluate(NUKE_ADS_JS)
 
         if removed:
-            log(
-                f"  Removed {removed} "
-                f"ad/overlay elements"
-            )
+            log(f"  Removed {removed} ad/overlay elements")
 
     except Exception:
-        # Page may be navigating when this runs.
+        # Page may be navigating.
         pass
 
 
-# ---------------------------------------------------------------------------
-# Cloudflare handling
-# ---------------------------------------------------------------------------
+def wait_for_cloudflare(page, timeout: int = 15):
+    """Wait for Cloudflare challenge to resolve if present."""
 
-def wait_for_cloudflare(
-    page,
-    timeout: int = 15,
-) -> None:
+    for i in range(timeout):
+        title = page.title().lower()
 
-    for attempt in range(timeout):
-
-        try:
-            title = page.title().lower()
-
-        except Exception:
-            title = ""
-
-        challenge = (
+        if (
             "just a moment" in title
             or "checking" in title
             or "cloudflare" in title
-        )
+        ):
+            if i == 0:
+                log("  Cloudflare challenge detected, waiting...")
 
-        if challenge:
-
-            if attempt == 0:
-                log(
-                    "  Cloudflare challenge detected, "
-                    "waiting..."
-                )
-
-            /*
-             * Calling wait_for_timeout keeps Playwright involved rather
-             * than using a long blocking Python sleep.
-             */
-            page.wait_for_timeout(1000)
+            time.sleep(1)
 
         else:
             return
 
-    log(
-        "  WARN: Cloudflare may not have resolved"
-    )
+    log("  WARN: Cloudflare may not have resolved")
 
-
-# ---------------------------------------------------------------------------
-# Find APK Bundle variant
-# ---------------------------------------------------------------------------
 
 def find_bundle_variant_url(page) -> str | None:
+    """On the release page, find the APK Bundle variant link."""
 
-    /*
-     * Strategy 1:
-     * Look through the variants table for rows containing BUNDLE.
-     */
+    # Strategy 1:
+    # Find rows containing "BUNDLE" text in the variants table.
     rows = page.query_selector_all(
-        ".variants-table .table-row, "
-        ".variants-table tr"
+        ".variants-table .table-row, .variants-table tr"
     )
 
     for row in rows:
+        text = row.inner_text().upper()
 
-        try:
-            text = row.inner_text().upper()
+        if "BUNDLE" in text:
+            link = row.query_selector(
+                "a[href*='apk-download']"
+            )
 
-        except Exception:
-            continue
+            if link:
+                return link.get_attribute("href")
 
-        if "BUNDLE" not in text:
-            continue
-
-        link = row.query_selector(
-            "a[href*='apk-download']"
-        )
-
-        if link:
-            return link.get_attribute("href")
-
-    /*
-     * Strategy 2:
-     * Broader search for apk-download links whose surrounding
-     * element contains BUNDLE.
-     */
-    links = page.query_selector_all(
+    # Strategy 2:
+    # Broader search for any apk-download link near "BUNDLE" text.
+    all_links = page.query_selector_all(
         "a[href*='apk-download']"
     )
 
-    for link in links:
-
-        try:
-            parent_text = link.evaluate(
-                """
-                el => (
-                    el.closest(
-                        '.table-row, tr, .list-widget'
-                    ) || el.parentElement
-                ).textContent || ''
-                """
-            )
-
-        except Exception:
-            continue
+    for link in all_links:
+        parent_text = link.evaluate(
+            """
+            el => (
+                el.closest(
+                    '.table-row, tr, .list-widget'
+                )
+                || el.parentElement
+            ).textContent || ''
+            """
+        )
 
         if "BUNDLE" in parent_text.upper():
             return link.get_attribute("href")
 
     return None
 
-
-# ---------------------------------------------------------------------------
-# Download APKM
-# ---------------------------------------------------------------------------
 
 def download_apkm(
     release_url: str,
@@ -337,13 +226,9 @@ def download_apkm(
         exist_ok=True,
     )
 
-    with sync_playwright() as playwright:
+    with sync_playwright() as p:
 
-        # ------------------------------------------------------------------
-        # Browser setup
-        # ------------------------------------------------------------------
-
-        browser = playwright.chromium.launch(
+        browser = p.chromium.launch(
             headless=True,
         )
 
@@ -365,28 +250,24 @@ def download_apkm(
 
         page = context.new_page()
 
-        # ------------------------------------------------------------------
-        # Network-level ad blocking
-        # ------------------------------------------------------------------
+        # ---------------------------------------------------------------
+        # Block ad/tracking requests at the network level.
+        # ---------------------------------------------------------------
 
         def block_ads(route):
             route.abort()
 
         for domain in AD_DOMAIN_KEYWORDS:
-
             page.route(
                 f"**/*{domain}*",
                 block_ads,
             )
 
-        log(
-            "Ad blocker active (network-level)"
-        )
+        log("Ad blocker active (network-level)")
 
-        # ==================================================================
-        # STEP 1
-        # Release page
-        # ==================================================================
+        # ---------------------------------------------------------------
+        # Step 1: Navigate to release page
+        # ---------------------------------------------------------------
 
         log(
             f"Step 1: Loading release page: "
@@ -401,17 +282,10 @@ def download_apkm(
 
         wait_for_cloudflare(page)
 
-        try:
-            page.wait_for_load_state(
-                "load",
-                timeout=30000,
-            )
-
-        except PwTimeout:
-            log(
-                "  WARN: Full page load timed out; "
-                "continuing"
-            )
+        page.wait_for_load_state(
+            "load",
+            timeout=30000,
+        )
 
         nuke_ads(page)
 
@@ -422,13 +296,13 @@ def download_apkm(
         )
 
         log(
-            f"  Page title: {page.title()}"
+            f"  Page title: "
+            f"{page.title()}"
         )
 
-        # ==================================================================
-        # STEP 2
-        # Find APK Bundle variant
-        # ==================================================================
+        # ---------------------------------------------------------------
+        # Step 2: Find the APK Bundle variant
+        # ---------------------------------------------------------------
 
         log(
             "Step 2: Looking for APK Bundle variant..."
@@ -464,9 +338,8 @@ def download_apkm(
                 if variant_url:
 
                     log(
-                        "  Bundle variant not found; "
-                        "falling back to supplied "
-                        "variant URL"
+                        "  Bundle variant not found, "
+                        "falling back to RSS variant URL"
                     )
 
                     bundle_href = variant_url
@@ -474,18 +347,14 @@ def download_apkm(
                 else:
 
                     log(
-                        "ERROR: Could not find "
-                        "APK Bundle variant on "
-                        "release page"
+                        "ERROR: Could not find APK Bundle "
+                        "variant on release page"
                     )
 
-                    browser.close()
                     sys.exit(1)
 
             if bundle_href.startswith("/"):
-                bundle_href = (
-                    BASE + bundle_href
-                )
+                bundle_href = BASE + bundle_href
 
             log(
                 f"  Navigating to variant page: "
@@ -500,35 +369,35 @@ def download_apkm(
 
             wait_for_cloudflare(page)
 
-            try:
-                page.wait_for_load_state(
-                    "load",
-                    timeout=30000,
-                )
-
-            except PwTimeout:
-                log(
-                    "  WARN: Full variant page "
-                    "load timed out; continuing"
-                )
-
-            nuke_ads(page)
-
-            screenshot(
-                page,
-                output_path,
-                "03_variant_page",
+            page.wait_for_load_state(
+                "load",
+                timeout=30000,
             )
 
-            log(
-                f"  Page title: "
-                f"{page.title()}"
-            )
+        nuke_ads(page)
 
-        # ==================================================================
-        # STEP 3
-        # Find Download APK Bundle button
-        # ==================================================================
+        screenshot(
+            page,
+            output_path,
+            "03_variant_page",
+        )
+
+        log(
+            f"  Page title: "
+            f"{page.title()}"
+        )
+
+        # ---------------------------------------------------------------
+        # Step 3: Find the download button
+        # ---------------------------------------------------------------
+
+        # APKMirror button example:
+        #
+        # <a rel="nofollow"
+        #    class="accent_bg btn btn-flat downloadButton ..."
+        #    href="/.../download/?key=...">
+        #     Download APK Bundle
+        # </a>
 
         log(
             "Step 3: Finding download button..."
@@ -551,40 +420,39 @@ def download_apkm(
                 "04_no_download_btn",
             )
 
-            try:
-                links = page.evaluate(
-                    """
-                    () =>
-                        Array.from(
-                            document.querySelectorAll('a')
-                        )
-                        .slice(0, 30)
-                        .map(a => ({
-                            class: a.className,
-                            href: a.href,
-                            text:
-                                a.textContent
-                                .trim()
-                                .substring(0, 80)
-                        }))
-                    """
+            links = page.evaluate(
+                """
+                () => Array.from(
+                    document.querySelectorAll('a')
                 )
-
-                log(
-                    f"  Page has these links: "
-                    f"{links}"
+                .slice(0, 30)
+                .map(
+                    a => ({
+                        class: a.className,
+                        href: a.href,
+                        text:
+                            a.textContent
+                            .trim()
+                            .substring(0, 80)
+                    })
                 )
+                """
+            )
 
-            except Exception:
-                pass
+            log(
+                f"  Page has these links: "
+                f"{links}"
+            )
 
             log(
                 "ERROR: Download button not found "
                 "(a.downloadButton)"
             )
 
-            browser.close()
             sys.exit(1)
+
+        # Extract the href via JS to confirm that we
+        # have the expected APKMirror button.
 
         btn_info = page.evaluate(
             """
@@ -610,13 +478,19 @@ def download_apkm(
         )
 
         log(
-            f"  Found button: {btn_info}"
+            f"  Found button: "
+            f"{btn_info}"
         )
 
-        # ==================================================================
-        # STEP 4
-        # Navigate to APKMirror trigger page
-        # ==================================================================
+        # ---------------------------------------------------------------
+        # Step 4: Navigate to download trigger page
+        # ---------------------------------------------------------------
+
+        # page.click() can fail when ad overlays intercept the
+        # click event, even after removing them because new ones
+        # can appear.
+        #
+        # Extract the URL and navigate directly instead.
 
         log(
             "Step 4: Navigating to download "
@@ -645,11 +519,11 @@ def download_apkm(
                 "download button href"
             )
 
-            browser.close()
             sys.exit(1)
 
         log(
-            f"  Navigating to: {key_href}"
+            f"  Navigating to: "
+            f"{key_href}"
         )
 
         page.goto(
@@ -673,10 +547,26 @@ def download_apkm(
             f"{page.title()}"
         )
 
-        # ==================================================================
-        # STEP 5
-        # Capture actual browser download
-        # ==================================================================
+        # ---------------------------------------------------------------
+        # Step 5: Trigger and capture the file download
+        # ---------------------------------------------------------------
+
+        # The trigger page contains:
+        #
+        # <a id="download-link"
+        #    href="/wp-content/themes/APKMirror/download.php?...">
+        #
+        # IMPORTANT:
+        #
+        # The previous implementation registered a page.on("download")
+        # callback and then used time.sleep() in a polling loop.
+        #
+        # With Playwright's synchronous API, that polling loop prevented
+        # the download event from being dispatched until another
+        # Playwright operation occurred.
+        #
+        # page.expect_download() arms Playwright's download listener
+        # before clicking and returns the Download object directly.
 
         log(
             "Step 5: Looking for download link..."
@@ -694,13 +584,13 @@ def download_apkm(
             dl_href = page.evaluate(
                 """
                 () => {
-                    const link =
+                    const a =
                         document.querySelector(
                             'a#download-link'
                         );
 
-                    return link
-                        ? link.href
+                    return a
+                        ? a.href
                         : null;
                 }
                 """
@@ -713,25 +603,6 @@ def download_apkm(
 
             nuke_ads(page)
 
-            /*
-             * IMPORTANT:
-             *
-             * The old implementation used:
-             *
-             *     page.on("download", ...)
-             *
-             * followed by:
-             *
-             *     while download_event is None:
-             *         time.sleep(...)
-             *
-             * With Playwright's synchronous API that polling loop can
-             * prevent the queued Playwright download event from being
-             * dispatched until another Playwright API call occurs.
-             *
-             * expect_download() solves the race by arming the download
-             * listener before clicking and waiting on Playwright itself.
-             */
             with page.expect_download(
                 timeout=120000
             ) as download_info:
@@ -765,31 +636,25 @@ def download_apkm(
                 / "debug_trigger_page.html"
             )
 
-            try:
-                debug_html.write_text(
-                    page.content()
-                )
-
-                log(
-                    f"  Trigger page HTML "
-                    f"saved to {debug_html}"
-                )
-
-            except Exception:
-                pass
+            debug_html.write_text(
+                page.content()
+            )
 
             log(
                 "ERROR: Download did not start "
                 "within 120 seconds"
             )
 
-            browser.close()
+            log(
+                f"  Trigger page HTML saved to "
+                f"{debug_html}"
+            )
+
             sys.exit(1)
 
-        # ==================================================================
-        # STEP 6
-        # Save downloaded APKM
-        # ==================================================================
+        # ---------------------------------------------------------------
+        # Step 6: Save downloaded file
+        # ---------------------------------------------------------------
 
         filename = (
             download_event.suggested_filename
@@ -800,31 +665,18 @@ def download_apkm(
             output_path / filename
         )
 
-        try:
-
-            download_event.save_as(
-                str(save_path)
-            )
-
-        except Exception as exc:
-
-            log(
-                f"ERROR: Could not save "
-                f"download: {exc}"
-            )
-
-            browser.close()
-            sys.exit(1)
+        download_event.save_as(
+            str(save_path)
+        )
 
         if not save_path.exists():
 
             log(
-                "ERROR: Playwright reported a "
-                "download but the saved file "
-                f"does not exist: {save_path}"
+                "ERROR: Download event completed "
+                "but the output file does not exist: "
+                f"{save_path}"
             )
 
-            browser.close()
             sys.exit(1)
 
         file_size = (
@@ -834,11 +686,9 @@ def download_apkm(
         if file_size <= 0:
 
             log(
-                "ERROR: Downloaded file "
-                "is empty"
+                "ERROR: Downloaded file is empty"
             )
 
-            browser.close()
             sys.exit(1)
 
         size_mb = (
@@ -847,25 +697,22 @@ def download_apkm(
         )
 
         log(
-            f"  Saved: {filename} "
+            f"  Saved: "
+            f"{filename} "
             f"({size_mb:.1f} MB)"
         )
 
         browser.close()
 
-        return save_path
+    return save_path
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main() -> None:
+def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Download F1 TV Android TV "
-            "APKM from APKMirror"
+            "Download F1TV APKM "
+            "from APKMirror"
         )
     )
 
@@ -880,9 +727,9 @@ def main() -> None:
         "--variant-url",
         default=None,
         help=(
-            "Direct APKMirror variant URL "
-            "used as a fallback if a bundle "
-            "cannot be identified automatically"
+            "Direct variant page URL "
+            "(fallback if bundle not found "
+            "on release page)"
         ),
     )
 
@@ -891,9 +738,8 @@ def main() -> None:
         "--output-dir",
         default=".",
         help=(
-            "Directory in which to save "
-            "the downloaded APKM "
-            "(default: current directory)"
+            "Output directory "
+            "(default: cwd)"
         ),
     )
 
@@ -905,9 +751,10 @@ def main() -> None:
         args.output_dir,
     )
 
-    # stdout is intentionally reserved for the downloaded path so
-    # shell/CI callers can consume it.
-    print(str(path))
+    # Print path to stdout for CI consumption.
+    print(
+        str(path)
+    )
 
 
 if __name__ == "__main__":
